@@ -1,0 +1,94 @@
+#! /bin/bash
+VERSION=1.0.0
+PREFIX=$1
+
+# If no user input, print usage
+if [[ $# == 0 ]]; then
+    echo "bactopia-teton - v${VERSION}"
+    echo ""
+    echo "bactopia-teton <OPT1> ... <OPTN>"
+    echo ""
+    exit
+fi
+
+if [ "$is_tarball" == "true" ]; then
+    mkdir database
+    tar -xzf $db -C database
+    KRAKEN_DB=\$(find database/ -name "hash.k2d" | sed 's=hash.k2d==')
+else
+    KRAKEN_DB=\$(find $db/ -name "hash.k2d" | sed 's=hash.k2d==')
+fi
+
+kraken2 \\
+    --db \$KRAKEN_DB \\
+    --threads $task.cpus \\
+    --unclassified-out $unclassified \\
+    --classified-out $classified \\
+    --report ${prefix}.kraken2.report.txt \\
+    --gzip-compressed \\
+    $paired \\
+    $options.args \\
+    $reads > kracken.out
+
+# Get read length
+if [ "${params.bracken_read_length}" == "0" ]; then
+    OBS_READ_LENGTH=\$(zcat ${reads[0]} | fastq-scan -q | jq -r '.qc_stats.read_median')
+    echo \$OBS_READ_LENGTH
+    # Pre-built Bracken databases come with 50,75,100,150,200,250,300, split the difference
+    if [ "\$OBS_READ_LENGTH" -gt 275 ]; then
+        READ_LENGTH="300"
+    elif [ "\$OBS_READ_LENGTH" -gt 225 ]; then
+        READ_LENGTH="250"
+    elif [ "\$OBS_READ_LENGTH" -gt 175 ]; then
+        READ_LENGTH="200"
+    elif [ "\$OBS_READ_LENGTH" -gt 125 ]; then
+        READ_LENGTH="150"
+    elif [ "\$OBS_READ_LENGTH" -gt 85 ]; then
+        READ_LENGTH="100"
+    elif [ "\$OBS_READ_LENGTH" -gt 65 ]; then
+        READ_LENGTH="75"
+    else
+        READ_LENGTH="50"
+    fi
+else
+    # use user defined read length
+    READ_LENGTH="${params.bracken_read_length}"
+fi
+
+bracken \\
+    $options.args2 \\
+    -d \$KRAKEN_DB \\
+    -r \$READ_LENGTH \\
+    -i ${prefix}.kraken2.report.txt \\
+    -w ${prefix}.bracken.report.txt \\
+    -o bracken.temp
+
+# Sort bracken report by 'fraction_total_reads' (column 7)
+head -n 1 bracken.temp > ${prefix}.bracken.abundances.txt
+grep -v "fraction_total_reads\$" bracken.temp | sort -k 7 -rn >> ${prefix}.bracken.abundances.txt
+
+# Compress Kraken FASTQs
+pigz -p $task.cpus *.fastq
+
+# Adjust bracken to include unclassified and produce summary
+kraken-bracken-summary.py \\
+    ${prefix} \\
+    ${prefix}.kraken2.report.txt \\
+    ${prefix}.bracken.report.txt \\
+    ${prefix}.bracken.abundances.txt
+
+# Create a Krona report from reports
+if [ "${params.skip_krona}" == "false" ]; then
+    # Kraken2
+    kreport2krona.py \\
+        --report ${prefix}.kraken2.report.txt \\
+        --output kraken2-krona.temp
+    ktImportText -o ${prefix}.kraken2.krona.html kraken2-krona.temp
+
+    # Bracken
+    kreport2krona.py \\
+        --report ${prefix}.bracken.report.txt \\
+        --output bracken-krona.temp
+    ktImportText -o ${prefix}.bracken.krona.html bracken-krona.temp
+    rm *-krona.temp
+fi
